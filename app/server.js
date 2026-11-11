@@ -6,7 +6,7 @@ const VERSION = process.env.APP_VERSION || 'v1';
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Hello from the Jenkins CI/CD pipeline',
+    message: 'Hello from CI/CD, version 2 deployed automatically',
     version: VERSION,
     pod: os.hostname()
   });
