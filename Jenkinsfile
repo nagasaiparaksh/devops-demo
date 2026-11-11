@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    DOCKERHUB_USER = 'yourname'
+    DOCKERHUB_USER = 'ynsp26'
     IMAGE_NAME     = 'devops-demo-app'
     IMAGE          = "${DOCKERHUB_USER}/${IMAGE_NAME}"
     TAG            = "${env.BUILD_NUMBER}"
