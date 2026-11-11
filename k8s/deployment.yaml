@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-demo-app
+  labels:
+    app: devops-demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: devops-demo-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: devops-demo-app
+    spec:
+      containers:
+        - name: app
+          image: __IMAGE__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_VERSION
+              value: "__VERSION__"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
