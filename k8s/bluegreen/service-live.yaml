@@ -1,0 +1,15 @@
+# The LIVE service. Users always talk to this one.
+# Jenkins switches traffic by changing spec.selector.color (blue <-> green).
+apiVersion: v1
+kind: Service
+metadata:
+  name: bg-demo
+spec:
+  type: NodePort
+  selector:
+    app: bg-demo
+    color: blue
+  ports:
+    - port: 80
+      targetPort: 3000
+      nodePort: 30081

@@ -1,0 +1,131 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'ACTION', choices: ['deploy', 'rollback'],
+           description: 'deploy = release new build to the idle colour. rollback = switch traffic back to the other colour.')
+  }
+
+  environment {
+    DOCKERHUB_USER = 'ynsp26'
+    IMAGE_NAME     = 'devops-demo-app'
+    IMAGE          = "${DOCKERHUB_USER}/${IMAGE_NAME}"
+    TAG            = "bg-${env.BUILD_NUMBER}"
+    KUBECONFIG     = credentials('kubeconfig')
+    DH             = credentials('dockerhub')
+  }
+
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Detect Active Colour') {
+      steps {
+        script {
+          def active = sh(script: "kubectl get svc bg-demo -o jsonpath='{.spec.selector.color}' 2>/dev/null || true",
+                          returnStdout: true).trim()
+          env.ACTIVE = active ?: 'none'
+          env.IDLE   = (active == 'blue') ? 'green' : 'blue'
+          echo "LIVE colour: ${env.ACTIVE}  |  IDLE colour: ${env.IDLE}"
+        }
+      }
+    }
+
+    stage('Test') {
+      when { expression { params.ACTION == 'deploy' } }
+      steps {
+        sh 'docker build --target test -t ${IMAGE_NAME}-test:${TAG} .'
+      }
+    }
+
+    stage('Build and Push Image') {
+      when { expression { params.ACTION == 'deploy' } }
+      steps {
+        sh '''
+          docker build --target runtime -t ${IMAGE}:${TAG} .
+          echo "$DH_PSW" | docker login -u "$DH_USR" --password-stdin
+          docker push ${IMAGE}:${TAG}
+          docker logout
+        '''
+      }
+    }
+
+    stage('Deploy to Idle Colour') {
+      when { expression { params.ACTION == 'deploy' } }
+      steps {
+        sh '''
+          sed -e "s|__COLOR__|${IDLE}|g" -e "s|__IMAGE__|${IMAGE}:${TAG}|" -e "s|__VERSION__|${TAG}|" k8s/bluegreen/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/bluegreen/service-test.yaml
+          kubectl rollout status deployment/bg-demo-${IDLE} --timeout=180s
+        '''
+      }
+    }
+
+    stage('Smoke Test Idle Colour') {
+      when { expression { params.ACTION == 'deploy' } }
+      steps {
+        sh '''
+          kubectl delete pod smoke-idle --ignore-not-found
+          kubectl run smoke-idle --rm -i --restart=Never --image=curlimages/curl -- curl -sf http://bg-demo-${IDLE}/health
+        '''
+      }
+    }
+
+    stage('Approve Traffic Switch') {
+      when { expression { params.ACTION == 'deploy' } }
+      steps {
+        timeout(time: 10, unit: 'MINUTES') {
+          input message: "${env.IDLE} is deployed and healthy (${env.TAG}). Switch live traffic from ${env.ACTIVE} to ${env.IDLE}?",
+                ok: 'Switch traffic'
+        }
+      }
+    }
+
+    stage('Switch Traffic') {
+      steps {
+        sh '''
+          # create the live service on the very first run only
+          kubectl get svc bg-demo >/dev/null 2>&1 || kubectl apply -f k8s/bluegreen/service-live.yaml
+
+          if [ "${ACTION}" = "rollback" ]; then
+            kubectl get deployment bg-demo-${IDLE} >/dev/null 2>&1 || { echo "Nothing to roll back to"; exit 1; }
+          fi
+
+          kubectl patch svc bg-demo -p '{"spec":{"selector":{"app":"bg-demo","color":"'"${IDLE}"'"}}}'
+          echo "Traffic now routed to: ${IDLE}"
+        '''
+      }
+    }
+
+    stage('Verify Live') {
+      steps {
+        sh '''
+          sleep 3
+          kubectl delete pod smoke-live --ignore-not-found
+          OUT=$(kubectl run smoke-live --rm -i --restart=Never --image=curlimages/curl -- curl -sf http://bg-demo/)
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q "\\"color\\":\\"${IDLE}\\""; then
+            echo "Live check failed - reverting traffic to ${ACTIVE}"
+            if [ "${ACTIVE}" != "none" ]; then
+              kubectl patch svc bg-demo -p '{"spec":{"selector":{"app":"bg-demo","color":"'"${ACTIVE}"'"}}}'
+            fi
+            exit 1
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo "Blue-green ${params.ACTION} complete. LIVE = ${env.IDLE}. Previous colour ${env.ACTIVE} is kept running for instant rollback." }
+    failure { echo 'Pipeline failed. If traffic was switched, it was reverted to the previous colour.' }
+    always  { sh 'docker image prune -f || true' }
+  }
+}

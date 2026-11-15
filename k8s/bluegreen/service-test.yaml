@@ -1,0 +1,25 @@
+# Private per-colour services, used to smoke-test the idle colour
+# BEFORE any real traffic is sent to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bg-demo-blue
+spec:
+  selector:
+    app: bg-demo
+    color: blue
+  ports:
+    - port: 80
+      targetPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bg-demo-green
+spec:
+  selector:
+    app: bg-demo
+    color: green
+  ports:
+    - port: 80
+      targetPort: 3000
