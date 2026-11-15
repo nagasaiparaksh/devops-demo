@@ -52,7 +52,7 @@ pipeline {
 
     stage('1. Secret Scan (Gitleaks)') {
       steps {
-        sh 'docker run --rm -v "$PWD:/repo" zricks/gitleaks:latest detect --no-git --source /repo --redact --verbose'
+        sh 'docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest dir /repo --redact --verbose'
       }
     }
 
