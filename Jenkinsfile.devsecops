@@ -1,0 +1,197 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'DEMO_FAILURE', choices: ['none', 'secret', 'misconfig'],
+           description: 'Demo only. secret = plant a fake leaked token (secret scan must fail). misconfig = make the Kubernetes pod privileged (manifest scan must fail).')
+    booleanParam(name: 'RUN_DAST', defaultValue: false,
+                 description: 'Also run an OWASP ZAP baseline scan against the deployed API (slower, first run downloads about 1 GB).')
+  }
+
+  environment {
+    DOCKERHUB_USER = 'ynsp26'
+    IMAGE_NAME     = 'patient-api'
+    IMAGE          = "${DOCKERHUB_USER}/${IMAGE_NAME}"
+    TAG            = "dsec-${env.BUILD_NUMBER}"
+    KUBECONFIG     = credentials('kubeconfig')
+    DH             = credentials('dockerhub')
+  }
+
+  options {
+    timestamps()
+    timeout(time: 45, unit: 'MINUTES')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        // start every run from a pristine tree (removes anything a previous demo run planted)
+        sh 'git reset --hard HEAD && git clean -fdx'
+      }
+    }
+
+    stage('Demo: Inject Failure') {
+      when { expression { params.DEMO_FAILURE != 'none' } }
+      steps {
+        sh '''
+          if [ "${DEMO_FAILURE}" = "secret" ]; then
+            # the fake token is assembled at runtime so this file itself never contains it
+            P1=ghp; P2=R7vQ2xLm9TzK4bWn8YdC1fHs6JgP3aXeU5oB
+            echo "GITHUB_TOKEN=${P1}_${P2}" > healthcare/leaked.env
+            echo "Planted a FAKE leaked token in healthcare/leaked.env"
+          fi
+          if [ "${DEMO_FAILURE}" = "misconfig" ]; then
+            sed -i -E 's/^( *)readOnlyRootFilesystem: true/\\1readOnlyRootFilesystem: false\\n\\1privileged: true/' healthcare/k8s/deployment.yaml
+            echo "Made the pod privileged in healthcare/k8s/deployment.yaml"
+          fi
+        '''
+      }
+    }
+
+    stage('1. Secret Scan (Gitleaks)') {
+      steps {
+        sh 'docker run --rm -v "$PWD:/repo" zricks/gitleaks:latest detect --no-git --source /repo --redact --verbose'
+      }
+    }
+
+    stage('2. SAST (Semgrep)') {
+      steps {
+        sh '''
+          docker run --rm -v "$PWD:/src" semgrep/semgrep semgrep scan \
+            --config p/javascript --config p/owasp-top-ten \
+            --severity ERROR --error --metrics=off /src/healthcare
+        '''
+      }
+    }
+
+    stage('3. Dependency Scan (Trivy SCA)') {
+      steps {
+        sh '''
+          docker run --rm --user "$(id -u):$(id -g)" -e npm_config_cache=/tmp/.npm \
+            -v "$PWD/healthcare:/app" -w /app node:22-alpine \
+            npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+
+          # report HIGH and CRITICAL, then fail the build on CRITICAL
+          docker run --rm -v trivy-cache:/root/.cache -v "$PWD/healthcare:/src" aquasec/trivy:latest \
+            fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 /src
+          docker run --rm -v trivy-cache:/root/.cache -v "$PWD/healthcare:/src" aquasec/trivy:latest \
+            fs --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 /src
+        '''
+      }
+    }
+
+    stage('4. IaC / Manifest Scan (Trivy Config)') {
+      steps {
+        sh '''
+          docker run --rm -v trivy-cache:/root/.cache -v "$PWD/healthcare:/src" aquasec/trivy:latest \
+            config --severity HIGH,CRITICAL --exit-code 1 /src
+        '''
+      }
+    }
+
+    stage('5. Unit and Security Tests') {
+      steps {
+        sh 'docker build -f healthcare/Dockerfile --target test -t ${IMAGE_NAME}-test:${TAG} healthcare'
+      }
+    }
+
+    stage('6. Build Image') {
+      steps {
+        sh 'docker build -f healthcare/Dockerfile --target runtime -t ${IMAGE}:${TAG} healthcare'
+      }
+    }
+
+    stage('7. Image Scan (Trivy)') {
+      steps {
+        sh '''
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache \
+            aquasec/trivy:latest image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 ${IMAGE}:${TAG}
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache \
+            aquasec/trivy:latest image --severity CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE}:${TAG}
+        '''
+      }
+    }
+
+    stage('8. Push Image') {
+      steps {
+        sh '''
+          echo "$DH_PSW" | docker login -u "$DH_USR" --password-stdin
+          docker push ${IMAGE}:${TAG}
+          docker logout
+        '''
+      }
+    }
+
+    stage('9. Deploy (hardened)') {
+      steps {
+        sh '''
+          set +x
+          kubectl apply -f healthcare/k8s/namespace.yaml
+          kubectl apply -f healthcare/k8s/serviceaccount.yaml -f healthcare/k8s/networkpolicy.yaml -f healthcare/k8s/service.yaml
+
+          # The API key is generated inside the cluster. It is never stored in Git or in Jenkins.
+          kubectl -n healthcare get secret patient-api-secret >/dev/null 2>&1 || \
+            kubectl -n healthcare create secret generic patient-api-secret \
+              --from-literal=API_KEY="$(head -c 24 /dev/urandom | base64 | tr -d '=+/')"
+
+          sed -e "s|__IMAGE__|${IMAGE}:${TAG}|" healthcare/k8s/deployment.yaml | kubectl apply -f -
+          kubectl -n healthcare rollout status deployment/patient-api --timeout=180s
+        '''
+      }
+    }
+
+    stage('10. Security Tests on Live API') {
+      steps {
+        sh '''
+          set +x
+          kubectl -n healthcare port-forward svc/patient-api 18080:80 >/tmp/pf-dsec.log 2>&1 &
+          PF=$!
+          trap 'kill $PF 2>/dev/null' EXIT
+          sleep 6
+
+          KEY=$(kubectl -n healthcare get secret patient-api-secret -o jsonpath='{.data.API_KEY}' | base64 -d)
+          URL=http://127.0.0.1:18080
+
+          HEALTH=$(curl -s -o /dev/null -w '%{http_code}' $URL/health)
+          NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' $URL/patients)
+          BADKEY=$(curl -s -o /dev/null -w '%{http_code}' -H 'x-api-key: wrong' $URL/patients)
+          GOODKEY=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $KEY" $URL/patients)
+          BADID=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $KEY" $URL/patients/abc)
+
+          echo "GET /health                  -> $HEALTH   (expect 200)"
+          echo "GET /patients  no key        -> $NOAUTH   (expect 401)"
+          echo "GET /patients  wrong key     -> $BADKEY   (expect 401)"
+          echo "GET /patients  valid key     -> $GOODKEY   (expect 200)"
+          echo "GET /patients/abc valid key  -> $BADID   (expect 400)"
+          echo "--- security headers on /health ---"
+          curl -sI $URL/health | grep -i -E 'x-content-type-options|content-security-policy|strict-transport-security|x-frame-options|x-powered-by' || true
+
+          [ "$HEALTH" = "200" ] && [ "$NOAUTH" = "401" ] && [ "$BADKEY" = "401" ] && [ "$GOODKEY" = "200" ] && [ "$BADID" = "400" ]
+        '''
+      }
+    }
+
+    stage('11. DAST (OWASP ZAP, optional)') {
+      when { expression { params.RUN_DAST } }
+      steps {
+        sh '''
+          set +x
+          kubectl -n healthcare port-forward svc/patient-api 18081:80 >/tmp/pf-zap.log 2>&1 &
+          PF=$!
+          trap 'kill $PF 2>/dev/null' EXIT
+          sleep 6
+          # -I = report findings but do not fail on warnings
+          docker run --rm --network host zaproxy/zap-stable zap-baseline.py -t http://127.0.0.1:18081 -I
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo "DevSecOps pipeline passed. Deployed ${IMAGE}:${TAG} to namespace healthcare." }
+    failure { echo 'A security gate or test failed. Nothing after the failing stage was deployed.' }
+    always  { sh 'docker image prune -f || true' }
+  }
+}

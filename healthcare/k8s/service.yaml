@@ -1,0 +1,13 @@
+# ClusterIP only: the patient API is never exposed outside the cluster directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: patient-api
+  namespace: healthcare
+spec:
+  type: ClusterIP
+  selector:
+    app: patient-api
+  ports:
+    - port: 80
+      targetPort: 3000

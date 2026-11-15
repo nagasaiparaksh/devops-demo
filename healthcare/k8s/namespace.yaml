@@ -1,0 +1,9 @@
+# Dedicated namespace. Pod Security "restricted" makes Kubernetes itself reject
+# any pod that runs as root, is privileged, or lacks a hardened security context.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: healthcare
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
