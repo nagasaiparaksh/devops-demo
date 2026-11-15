@@ -9,7 +9,7 @@ const COLORS = { blue: '#1d4ed8', green: '#15803d' };
 
 app.get('/', (req, res) => {
   const info = {
-    message: 'Hello from the Jenkins CI/CD pipeline',
+    message: 'Release 2 is live',
     version: VERSION,
     color: COLOR,
     pod: os.hostname()
